@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>布莱克殿下大驾光临</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        :root { --pink: #ff85a1; --gold: #ffd700; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'STHeiti', sans-serif; }
+        #login-screen { position: fixed; z-index: 3000; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #fff0f3; transition: 0.8s; }
+        .login-card { background: white; padding: 30px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.1); width: 320px; }
+        #top-info { position: fixed; top: 40px; width: 100%; text-align: center; color: white; z-index: 100; font-size: 30px; font-weight: bold; text-shadow: 0 0 15px var(--pink); pointer-events: none; }
+        #score-ui { position: fixed; top: 20px; right: 20px; color: var(--gold); font-size: 24px; z-index: 100; display: none; background: rgba(0,0,0,0.4); padding: 5px 15px; border-radius: 20px; }
+        canvas { position: absolute; top: 0; left: 0; }
+        #final-screen { position: fixed; z-index: 4000; width: 100%; height: 100%; background: #900d0d; display: none; flex-direction: column; justify-content: center; align-items: center; color: #fff; text-align: center; opacity: 0; transition: 2s; overflow: hidden; }
+        .final-cake { font-size: 100px; margin: 20px; z-index: 10; }
+        .balloon { position: absolute; bottom: -100px; font-size: 40px; animation: fly 8s linear infinite; }
+        @keyframes fly { to { transform: translateY(-1200px) rotate(20deg); } }
+        video { display: none; }
+    </style>
+</head>
+<body>
+
+    <audio id="bgm" src="bgm.mp3" loop></audio>
+
+    <div id="login-screen">
+        <div class="login-card">
+            <h2 style="color:var(--pink)">提示：密码是你的生日</h2>
+            <input type="text" id="username" placeholder="用户名" style="width:80%; padding:10px; margin:10px; border:1px solid #ddd; border-radius:8px;">
+            <input type="password" id="birthday" placeholder="密码(20000101)" style="width:80%; padding:10px; margin:10px; border:1px solid #ddd; border-radius:8px;">
+            <button onclick="startApp()" style="padding:12px 40px; background:var(--pink); color:white; border:none; border-radius:25px; cursor:pointer; font-weight:bold;">登录</button>
+        </div>
+    </div>
+
+    <div id="final-screen">
+        <div id="fireworks-container"></div>
+        <h1 id="final-msg" style="font-size: 45px; z-index: 10;"></h1>
+        <div class="final-cake">🎂</div>
+        <p style="font-size: 24px; z-index: 10;">愿你历经千帆，归来仍是少年 ✨</p>
+    </div>
+
+    <div id="top-info">正在加载中..</div>
+    <div id="score-ui">祝福能量: <span id="score">0</span> / 100</div>
+    
+    <canvas id="game-canvas" style="z-index:20;"></canvas>
+    <div id="three-container" style="z-index:10;"></div>
+    <video id="webcam"></video>
+
+    <script>
+        let scene, camera, renderer, particles, targetCoords = [];
+        let gCanvas, gCtx, handX, handY, prevHandX, prevHandY, isHandActive = false;
+        let gameState = "LOADING", currentStep = 3;
+        let nameStr = "", ageNum = 0, scoreCount = 0;
+        let bags = [], floatingTexts = [], trails = [];
+        const blessings = ["财源滚滚", "永远年轻", "万事如意", "心想事成", "笑口常开", "平安喜乐"];
+
+        // 1. 手势识别逻辑
+        const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7 });
+        hands.onResults(results => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                isHandActive = true;
+                const lm = results.multiHandLandmarks[0];
+                prevHandX = handX; prevHandY = handY;
+                // 采用掌心位置(0和9的中心)
+                handX = (1 - (lm[0].x + lm[9].x) / 2) * window.innerWidth;
+                handY = ((lm[0].y + lm[9].y) / 2) * window.innerHeight;
+
+                if(gameState === "GAME") {
+                    trails.push({x: handX, y: handY});
+                    if(trails.length > 10) trails.shift();
+                    checkSlice();
+                } else if(gameState === "CAKE_STAGE") {
+                    // 检测掌劈动作 (瞬间横向或纵向移动距离大于100)
+                    if(Math.abs(handX - prevHandX) > 100 || Math.abs(handY - prevHandY) > 100) {
+                        explodeCake();
+                    }
+                } else if(gameState === "INTRO") {
+                    let fingers = 0;
+                    [8,12,16,20].forEach((tip,i) => { if(lm[tip].y < lm[[6,10,14,18][i]].y) fingers++; });
+                    if(fingers === currentStep) { currentStep--; nextStage(); }
+                }
+            } else { isHandActive = false; trails = []; }
+        });
+
+        // 2. 3D 粒子采样逻辑 (修复文字正确展现)
+        function setTarget(type, data) {
+            targetCoords = [];
+            const off = document.createElement('canvas');
+            const octx = off.getContext('2d');
+            off.width = 1200; off.height = 400;
+            octx.fillStyle = "white";
+            
+            if(type === 'text') {
+                octx.font = `bold ${data.size}px "Microsoft YaHei"`;
+                octx.textAlign = "center";
+                octx.textBaseline = "middle";
+                octx.fillText(data.content, 600, 200);
+            } else if(type === 'cake') {
+                // 画一个简单的蛋糕轮廓用于采样
+                octx.fillRect(450, 250, 300, 100); // 底层
+                octx.fillRect(500, 180, 200, 70);  // 中层
+                octx.fillRect(570, 140, 60, 40);   // 顶部蜡烛
+            }
+
+            const imgData = octx.getImageData(0,0,1200,400).data;
+            for(let y=0; y<400; y+=4) {
+                for(let x=0; x<1200; x+=4) {
+                    if(imgData[(y*1200 + x)*4] > 128) {
+                        targetCoords.push({ x: (x-600)*0.8, y: (200-y)*0.8 });
+                    }
+                }
+            }
+        }
+
+        // 3. 流程控制
+        const info = document.getElementById('top-info');
+        async function nextStage() {
+            if(currentStep === 2) { setTarget('text', {content: "3", size: 300}); info.innerText = "比出数字 2 ✌️"; }
+            else if(currentStep === 1) { setTarget('text', {content: "2", size: 300}); info.innerText = "比出数字 1 ☝️"; }
+            else if(currentStep === 0) {
+                gameState = "WISHES";
+                info.innerText = "HAPPY BIRTHDAY!";
+                setTarget('text', {content: "1", size: 300});
+                
+                // 依次展示祝福语
+                const sequence = [
+                    {t: `祝${ageNum}岁的${nameStr}`, s: 120},
+                    {t: "生日快乐！", s: 150},
+                    {t: "愿你眼中总有光芒", s: 90},
+                    {t: "愿你永远桂花弄酒，有朋有酒", s: 70},
+                    {t: "愿你所得皆所愿", s: 90}
+                ];
+
+                for(let item of sequence) {
+                    await new Promise(r => setTimeout(r, 2500));
+                    setTarget('text', {content: item.t, size: item.s});
+                }
+
+                // 展示蛋糕
+                await new Promise(r => setTimeout(r, 3000));
+                gameState = "CAKE_STAGE";
+                info.innerText = "🎂 掌劈蛋糕，开启好运！";
+                setTarget('cake', {});
+            }
+        }
+
+        function explodeCake() {
+            // 粒子散开
+            targetCoords = Array.from({length: 2000}, () => ({
+                x: (Math.random()-0.5)*2000, y: (Math.random()-0.5)*2000
+            }));
+            setTimeout(() => {
+                gameState = "GAME";
+                document.getElementById('three-container').style.display = "none";
+                document.getElementById('score-ui').style.display = "block";
+                info.innerText = "用食指切开福袋，接收祝福！";
+                init2DGame();
+            }, 800);
+        }
+
+        // 4. 2D 小游戏
+        function init2DGame() {
+            gCanvas = document.getElementById('game-canvas');
+            gCtx = gCanvas.getContext('2d');
+            gCanvas.width = window.innerWidth;
+            gCanvas.height = window.innerHeight;
+            
+            setInterval(() => {
+                if(gameState === "GAME") bags.push({x: Math.random()*window.innerWidth, y: -50, speed: 5+Math.random()*3});
+            }, 800);
+            render2D();
+        }
+
+        function checkSlice() {
+            bags.forEach((b, i) => {
+                let d = Math.sqrt(Math.pow(handX - b.x, 2) + Math.pow(handY - b.y, 2));
+                if(d < 60) {
+                    scoreCount += 10;
+                    document.getElementById('score').innerText = scoreCount;
+                    floatingTexts.push({text: blessings[Math.floor(Math.random()*blessings.length)], x: b.x, y: b.y, a: 1});
+                    bags.splice(i, 1);
+                    if(scoreCount >= 100) triggerFinal();
+                }
+            });
+        }
+
+        function render2D() {
+            if(gameState !== "GAME") return;
+            gCtx.clearRect(0,0, gCanvas.width, gCanvas.height);
+
+            // 白色圆环准星
+            if(isHandActive) {
+                gCtx.strokeStyle = "white"; gCtx.lineWidth = 3;
+                gCtx.beginPath(); gCtx.arc(handX, handY, 20, 0, Math.PI*2); gCtx.stroke();
+            }
+
+            // 福袋掉落
+            bags.forEach((b, i) => {
+                b.y += b.speed;
+                gCtx.fillStyle = "#e63946"; gCtx.beginPath(); gCtx.arc(b.x, b.y, 35, 0, Math.PI*2); gCtx.fill();
+                gCtx.fillStyle = "#ffd700"; gCtx.font = "bold 22px Arial"; gCtx.fillText("福", b.x-11, b.y+8);
+                if(b.y > gCanvas.height) bags.splice(i, 1);
+            });
+
+            // 渐变祝福语
+            floatingTexts.forEach((f, i) => {
+                f.y -= 2.5; f.a -= 0.015;
+                gCtx.fillStyle = `rgba(255, 215, 0, ${f.a})`;
+                gCtx.font = "bold 28px STHeiti";
+                gCtx.fillText(f.text, f.x-40, f.y);
+                if(f.a <= 0) floatingTexts.splice(i, 1);
+            });
+            requestAnimationFrame(render2D);
+        }
+
+        // 5. 最终结算
+        function triggerFinal() {
+            gameState = "FINAL";
+            const screen = document.getElementById('final-screen');
+            document.getElementById('final-msg').innerText = `祝 ${ageNum} 岁的 ${nameStr} 生日快乐！`;
+            screen.style.display = "flex";
+            setTimeout(() => screen.style.opacity = 1, 100);
+            
+            // 气球动画
+            for(let i=0; i<15; i++) {
+                let b = document.createElement('div');
+                b.className = 'balloon';
+                b.innerText = ['🎈','🎈','🎈'][Math.floor(Math.random()*3)];
+                b.style.left = Math.random()*100 + 'vw';
+                b.style.animationDelay = Math.random()*5 + 's';
+                screen.appendChild(b);
+            }
+        }
+
+        // --- 启动与环境渲染 ---
+        async function startApp() {
+            nameStr = document.getElementById('username').value || "寿星";
+            const bday = document.getElementById('birthday').value;
+            if(bday.length !== 8) return alert("请输入8位生日");
+            ageNum = 2026 - parseInt(bday.substring(0,4));
+
+            document.getElementById('bgm').play();
+            document.getElementById('login-screen').style.opacity = 0;
+            setTimeout(() => document.getElementById('login-screen').style.display="none", 800);
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 1, 1000);
+            camera.position.z = 400;
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('three-container').appendChild(renderer.domElement);
+
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(18000 * 3);
+            for(let i=0; i<54000; i++) pos[i] = (Math.random()-0.5)*1200;
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            particles = new THREE.Points(geo, new THREE.PointsMaterial({ size: 2, color: 0xffffff }));
+            scene.add(particles);
+
+            function animate() {
+                requestAnimationFrame(animate);
+                const p = particles.geometry.attributes.position.array;
+                const total = targetCoords.length;
+                for(let i=0; i<18000; i++) {
+                    const i3 = i * 3;
+                    if(total > 0) {
+                        const t = targetCoords[i % total];
+                        p[i3] += (t.x - p[i3]) * 0.12;
+                        p[i3+1] += (t.y - p[i3+1]) * 0.12;
+                        p[i3+2] += (0 - p[i3+2]) * 0.12;
+                    }
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+                renderer.render(scene, camera);
+            }
+            animate();
+
+            const video = document.getElementById('webcam');
+            const cam = new Camera(video, { onFrame: async () => await hands.send({image: video}), width: 1280, height: 720 });
+            await cam.start();
+            gameState = "INTRO";
+            document.getElementById('top-info').innerText = "请比出数字 3 开始魔法";
+            nextStage();
+        }
+    </script>
+</body>
+</html>
